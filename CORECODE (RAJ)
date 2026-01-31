@@ -1,0 +1,444 @@
+import numpy as np
+import pandas as pd
+
+from sklearn.linear_model import Lasso, Ridge
+from typing import Tuple, List
+import warnings
+warnings.filterwarnings('ignore')
+
+class LorentzianKNN:
+    def __init__(self, k_neighbors=8, lookback=500, sample_interval=4, 
+                 regression_window=250, future_bars=4, use_lasso=True):
+        """
+        Initialize Lorentzian KNN Trading Algorithm
+        
+        Parameters:
+        - k_neighbors: Number of nearest neighbors (K)
+        - lookback: Historical window for KNN search
+        - sample_interval: Sampling interval for historical data
+        - regression_window: Rolling window for L1/L2 regression
+        - future_bars: Number of bars ahead for prediction
+        - use_lasso: True for L1 (Lasso), False for L2 (Ridge)
+        """
+        self.k = k_neighbors
+        self.lookback = lookback
+        self.sample_interval = sample_interval
+        self.regression_window = regression_window
+        self.future_bars = future_bars
+        self.regression_model = Lasso(alpha=0.01) if use_lasso else Ridge(alpha=0.01)
+        
+    def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute 5-dimensional feature vector from OHLCV data
+        """
+        data = df.copy()
+        
+        # Feature 1: Price Change (within bar)
+        data['price_change'] = (data['Close'] - data['Open']) / data['Open']
+        
+        # Feature 2: Bar Volatility (range as % of close)
+        data['bar_volatility'] = (data['High'] - data['Low']) / data['Close']
+        
+        # Feature 3: 1-Bar Return
+        data['return_1bar'] = data['Close'].pct_change(1)
+        
+        # Feature 4: 2-Bar Return
+        data['return_2bar'] = data['Close'].pct_change(2)
+        
+        # Feature 5: Volume Change Ratio
+        data['volume_ratio'] = data['Volume'] / data['Volume'].shift(1)
+        
+        return data
+    
+    def compute_targets(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute prediction targets
+        """
+        data = df.copy()
+        
+        # Continuous Target: 4-bar future return
+        data['continuous_target'] = (data['Close'].shift(-self.future_bars) / data['Close']) - 1
+        
+        # Directional Target: 1 if up, -1 if down
+        data['directional_target'] = np.where(
+            data['Close'].shift(-self.future_bars) > data['Close'], 1, -1
+        )
+        
+        return data
+    
+    def lorentzian_distance(self, x1: np.ndarray, x2: np.ndarray) -> float:
+        """
+        Calculate modified Lorentzian distance
+        distance = sum(log(1 + |x1_i - x2_i|))
+        """
+        x1 = np.asarray(x1, dtype=np.float64)
+        x2 = np.asarray(x2, dtype=np.float64)
+        return np.sum(np.log(1 + np.abs(x1 - x2)))
+    
+    def knn_predict(self, current_features: np.ndarray, historical_data: pd.DataFrame, 
+                    current_idx: int) -> int:
+        """
+        Generate raw KNN prediction using Lorentzian distance
+        """
+        # Define lookback window
+        start_idx = max(0, current_idx - self.lookback)
+        end_idx = current_idx
+        
+        # Sample historical data
+        sample_indices = list(range(start_idx, end_idx, self.sample_interval))
+        if not sample_indices:
+            return 0
+        
+        feature_cols = ['price_change', 'bar_volatility', 'return_1bar', 
+                       'return_2bar', 'volume_ratio']
+        
+        # Calculate distances
+        distances = []
+        targets = []
+        
+        for idx in sample_indices:
+            if idx >= len(historical_data) or pd.isna(historical_data.iloc[idx][feature_cols]).any():
+                continue
+                
+            hist_features = historical_data.iloc[idx][feature_cols].values
+            dist = self.lorentzian_distance(current_features, hist_features)
+            distances.append(dist)
+            targets.append(historical_data.iloc[idx]['directional_target'])
+        
+        if len(distances) < self.k:
+            return 0
+        
+        # Find K nearest neighbors
+        k_indices = np.argsort(distances)[:self.k]
+        k_targets = [targets[i] for i in k_indices]
+        
+        # Raw prediction: sign of sum
+        prediction_sum = sum(k_targets)
+        return np.sign(prediction_sum)
+    
+    def kernel_regression(self, y: np.ndarray, bandwidth: float, 
+                         kernel_type: str = 'gaussian') -> np.ndarray:
+        """
+        Nadaraya-Watson kernel regression
+        """
+        n = len(y)
+        yhat = np.zeros(n)
+        
+        for i in range(n):
+            if i < bandwidth:
+                yhat[i] = y[i]
+                continue
+                
+            weights = np.zeros(i)
+            x_diff = np.arange(i) - i
+            
+            if kernel_type == 'gaussian':
+                weights = np.exp(-0.5 * (x_diff / bandwidth) ** 2)
+            elif kernel_type == 'rational_quadratic':
+                weights = 1 / (1 + (x_diff / bandwidth) ** 2)
+            
+            weights = weights / np.sum(weights)
+            yhat[i] = np.sum(weights * y[:i])
+        
+        return yhat
+    
+    def regression_filter(self, data: pd.DataFrame, current_idx: int) -> float:
+        """
+        Train L1/L2 regression and predict future return
+        """
+        start_idx = max(0, current_idx - self.regression_window)
+        
+        if current_idx - start_idx < 50:
+            return 0
+        
+        feature_cols = ['price_change', 'bar_volatility', 'return_1bar', 
+                       'return_2bar', 'volume_ratio']
+        
+        train_data = data.iloc[start_idx:current_idx]
+        train_data = train_data.dropna(subset=feature_cols + ['continuous_target'])
+        
+        if len(train_data) < 30:
+            return 0
+        
+        X_train = train_data[feature_cols].values
+        y_train = train_data['continuous_target'].values
+        
+        try:
+            self.regression_model.fit(X_train, y_train)
+            current_features = data.iloc[current_idx][feature_cols].values.reshape(1, -1)
+            prediction = self.regression_model.predict(current_features)[0]
+            return prediction
+        except:
+            return 0
+    
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate final trading signals with all filters
+        """
+        data = self.compute_features(df)
+        data = self.compute_targets(data)
+        
+        # Apply kernel smoothing
+        bandwidth_rq = 8
+        bandwidth_gauss = 6
+        
+        data['yhat_rq'] = self.kernel_regression(
+            data['Close'].values, bandwidth_rq, 'rational_quadratic'
+        )
+        data['yhat_gauss'] = self.kernel_regression(
+            data['Close'].values, bandwidth_gauss, 'gaussian'
+        )
+        
+        # Calculate average range for volatility filter
+        data['bar_range'] = data['High'] - data['Low']
+        data['avg_range_14'] = data['bar_range'].rolling(14).mean()
+        
+        # Initialize signal columns
+        data['knn_prediction'] = 0
+        data['regression_prediction'] = 0.0
+        data['final_signal'] = 0
+        
+        feature_cols = ['price_change', 'bar_volatility', 'return_1bar', 
+                       'return_2bar', 'volume_ratio']
+        
+        # Generate signals for each bar
+        for i in range(self.lookback + self.regression_window, len(data) - self.future_bars):
+            # Skip if NaN features
+            if pd.isna(data.iloc[i][feature_cols]).any():
+                continue
+            
+            # KNN Prediction
+            current_features = data.iloc[i][feature_cols].values
+            knn_pred = self.knn_predict(current_features, data, i)
+            data.iloc[i, data.columns.get_loc('knn_prediction')] = knn_pred
+            
+            # Regression Prediction
+            reg_pred = self.regression_filter(data, i)
+            data.iloc[i, data.columns.get_loc('regression_prediction')] = reg_pred
+            
+            # Apply final entry filters
+            close_current = data.iloc[i]['Close']
+            close_50_ago = data.iloc[i - 50]['Close']
+            bar_range = data.iloc[i]['bar_range']
+            avg_range = data.iloc[i]['avg_range_14']
+            yhat_gauss = data.iloc[i]['yhat_gauss']
+            yhat_rq = data.iloc[i]['yhat_rq']
+            
+            # Long Signal
+            if (knn_pred == 1 and 
+                reg_pred > 0 and 
+                close_current > close_50_ago and 
+                bar_range > avg_range and 
+                yhat_gauss >= yhat_rq):
+                data.iloc[i, data.columns.get_loc('final_signal')] = 1
+            
+            # Short Signal
+            elif (knn_pred == -1 and 
+                  reg_pred < 0 and 
+                  close_current < close_50_ago and 
+                  bar_range > avg_range and 
+                  yhat_gauss <= yhat_rq):
+                data.iloc[i, data.columns.get_loc('final_signal')] = -1
+        
+        return data
+    
+    def backtest(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
+        """
+        Backtest the strategy with entry/exit logic
+        """
+        data = self.generate_signals(df)
+        
+        trades = []
+        position = 0
+        entry_price = 0
+        entry_bar = 0
+        bars_in_trade = 0
+        
+        for i in range(len(data) - 1):
+            signal = data.iloc[i]['final_signal']
+            
+            # Check if in position
+            if position != 0:
+                bars_in_trade += 1
+                
+                # Exit conditions
+                exit_trade = False
+                exit_reason = ''
+                
+                # Time-based exit (4 bars)
+                if bars_in_trade >= self.future_bars:
+                    exit_trade = True
+                    exit_reason = 'time_exit'
+                
+                # Early flip exit
+                elif signal != position and signal != 0:
+                    exit_trade = True
+                    exit_reason = 'flip_exit'
+                
+                if exit_trade:
+                    exit_price = data.iloc[i + 1]['Open']
+                    pnl = (exit_price - entry_price) * position
+                    pnl_pct = ((exit_price / entry_price) - 1) * position * 100
+                    
+                    trades.append({
+                        'entry_bar': entry_bar,
+                        'exit_bar': i + 1,
+                        'direction': 'Long' if position == 1 else 'Short',
+                        'entry_price': entry_price,
+                        'exit_price': exit_price,
+                        'pnl': pnl,
+                        'pnl_pct': pnl_pct,
+                        'bars_held': bars_in_trade,
+                        'exit_reason': exit_reason
+                    })
+                    
+                    position = 0
+                    bars_in_trade = 0
+            
+            # Entry logic (if not in position and signal exists)
+            if position == 0 and signal != 0:
+                position = signal
+                entry_price = data.iloc[i + 1]['Open']
+                entry_bar = i + 1
+                bars_in_trade = 0
+        
+        # Calculate performance metrics
+        trades_df = pd.DataFrame(trades)
+        
+        if len(trades_df) > 0:
+            wins = len(trades_df[trades_df['pnl'] > 0])
+            losses = len(trades_df[trades_df['pnl'] <= 0])
+            win_rate = (wins / len(trades_df)) * 100
+            total_pnl = trades_df['pnl'].sum()
+            avg_pnl = trades_df['pnl'].mean()
+            avg_win = trades_df[trades_df['pnl'] > 0]['pnl'].mean() if wins > 0 else 0
+            avg_loss = trades_df[trades_df['pnl'] <= 0]['pnl'].mean() if losses > 0 else 0
+            
+            metrics = {
+                'total_trades': len(trades_df),
+                'wins': wins,
+                'losses': losses,
+                'win_rate': win_rate,
+                'total_pnl': total_pnl,
+                'avg_pnl': avg_pnl,
+                'avg_win': avg_win,
+                'avg_loss': avg_loss,
+                'profit_factor': abs(avg_win * wins / (avg_loss * losses)) if losses > 0 and avg_loss != 0 else 0
+            }
+        else:
+            metrics = {
+                'total_trades': 0,
+                'wins': 0,
+                'losses': 0,
+                'win_rate': 0,
+                'total_pnl': 0,
+                'avg_pnl': 0,
+                'avg_win': 0,
+                'avg_loss': 0,
+                'profit_factor': 0
+            }
+        
+        return trades_df, metrics
+
+
+# Example usage
+if __name__ == "__main__":
+    # Generate sample OHLCV data
+    np.random.seed(42)
+    n_bars = 2000
+    
+    dates = pd.date_range(start='2020-01-01', periods=n_bars, freq='1H')
+    base_price = 100
+    
+    # Generate realistic price data
+    returns = np.random.randn(n_bars) * 0.02
+    close_prices = base_price * np.exp(np.cumsum(returns))
+    
+    sample_data = pd.DataFrame({
+        'Date': dates,
+        'Open': close_prices * (1 + np.random.randn(n_bars) * 0.005),
+        'High': close_prices * (1 + np.abs(np.random.randn(n_bars) * 0.01)),
+        'Low': close_prices * (1 - np.abs(np.random.randn(n_bars) * 0.01)),
+        'Close': close_prices,
+        'Volume': np.random.randint(1000, 10000, n_bars)
+    })
+    
+    # Ensure High is highest and Low is lowest
+    sample_data['High'] = sample_data[['Open', 'High', 'Close']].max(axis=1)
+    sample_data['Low'] = sample_data[['Open', 'Low', 'Close']].min(axis=1)
+    
+    # Initialize and run strategy
+    strategy = LorentzianKNN(
+        k_neighbors=8,
+        lookback=3000,
+        sample_interval=4,
+        regression_window=5000,
+        future_bars=4,
+        use_lasso=True
+    )
+# Load the OHLCV data (CSV with columns: Timestamp, Open, High, Low, Close, Volume)
+df = pd.read_excel('Sidebar_Merged.xlsx')
+
+# Remove any whitespace column names
+df.columns = df.columns.str.strip()
+
+# Drop rows with missing data (if any)
+df = df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'])
+
+# Make sure to sort chronologically if not already sorted
+df = df.sort_values('Timestamp').reset_index(drop=True)
+
+# Find 80:20 split index
+split_index = int(len(df) * 0.8)
+
+# Split the data
+train_df = df.iloc[:split_index].reset_index(drop=True)
+test_df = df.iloc[split_index:].reset_index(drop=True)
+
+# Combine for feature/target calculation but only test on test_df
+full_df = pd.concat([train_df, test_df], ignore_index=True)
+
+# Initialize the model
+strategy = LorentzianKNN()
+
+# Run backtest on entire data to avoid NaN issues in features/targets, but filter trades to show only ones in test
+trades_df, metrics = strategy.backtest(full_df)
+
+# Filter trades that were both entered and exited inside test set
+test_start_bar = split_index
+test_end_bar = len(full_df)-1
+if not trades_df.empty:
+    test_trades = trades_df[
+        (trades_df['entry_bar'] >= test_start_bar) & (trades_df['exit_bar'] <= test_end_bar)
+    ]
+else:
+    test_trades = pd.DataFrame() # Create an empty DataFrame if no trades
+
+print("="*60)
+print("TEST SET BACKTEST RESULTS (80:20) - LORENTZIAN KNN")
+print("="*60)
+print(f"Test Trades: {len(test_trades)}")
+if len(test_trades) > 0:
+    wins = len(test_trades[test_trades['pnl'] > 0])
+    losses = len(test_trades[test_trades['pnl'] <= 0])
+    win_rate = (wins / len(test_trades)) * 100
+    total_pnl = test_trades['pnl'].sum()
+    avg_pnl = test_trades['pnl'].mean()
+    avg_win = test_trades[test_trades['pnl'] > 0]['pnl'].mean() if wins > 0 else 0
+    avg_loss = test_trades[test_trades['pnl'] <= 0]['pnl'].mean() if losses > 0 else 0
+    profit_factor = abs(avg_win * wins / (avg_loss * losses)) if losses > 0 and avg_loss != 0 else 0
+    print(f"Wins: {wins}")
+    print(f"Losses: {losses}")
+    print(f"Win Rate: {win_rate:.2f}%")
+    print(f"Total P&L: {total_pnl:.2f}")
+    print(f"Average P&L per Trade: {avg_pnl:.2f}")
+    print(f"Average Win: {avg_win:.2f}")
+    print(f"Average Loss: {avg_loss:.2f}")
+    print(f"Profit Factor: {profit_factor:.2f}")
+    print("\nFirst 10 Test Trades:")
+    print(test_trades.head(10).to_string(index=False))
+else:
+    print("No test trades executed.")
+
+print("\n\nDetailed ALL Test Trades:")
+print(test_trades.to_string(index=False))
