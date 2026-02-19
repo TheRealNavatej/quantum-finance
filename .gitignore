@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Generated output files (charts, reports, results)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.xlsx
+*.csv
+*.docx
+
+# Debug/temp files
+debug_output.txt
+docx_content.txt
+*.log
+*.tmp
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
